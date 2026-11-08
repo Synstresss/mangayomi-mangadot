@@ -9,7 +9,7 @@ const mangayomiSources = [
     "typeSource": "single",
     "isManga": true,
     "isNsfw": false,
-    "version": "0.1.0",
+    "version": "0.1.1",
     "dateFormat": "",
     "dateFormatLocale": "",
     "pkgPath": "manga/src/en/mangadot.js"
@@ -150,8 +150,26 @@ class DefaultExtension extends MProvider {
   getHeaders(url) {
     return {
       "Referer": this.source.baseUrl + "/",
-      "Origin": this.source.baseUrl,
     };
+  }
+
+  // Throws a readable error instead of letting the app show a silent "No result".
+  checkResponse(res, what) {
+    const body = res.body || "";
+    const code = res.statusCode;
+    const looksLikeChallenge =
+      body.includes("Just a moment...") ||
+      body.includes("challenge-platform") ||
+      body.includes("cf-browser-verification");
+    if (code === 403 || code === 503 || looksLikeChallenge) {
+      throw new Error(
+        `MangaDot: Cloudflare is still blocking the app (HTTP ${code}) while loading ${what}. ` +
+          `Open the source in WebView, pass the check, then pull down to refresh.`
+      );
+    }
+    if (code >= 400) {
+      throw new Error(`MangaDot: HTTP ${code} while loading ${what}.`);
+    }
   }
 
   absUrl(path) {
@@ -202,11 +220,36 @@ class DefaultExtension extends MProvider {
       .map((k) => `${k}=${encodeURIComponent(params[k])}`)
       .join("&");
     const res = await this.request(`/search?${qs}`);
+    this.checkResponse(res, "the search page");
     return this.parseMangaList(res.body, page);
   }
 
+  pageTitle(html) {
+    const m = String(html || "").match(/<title[^>]*>([^<]*)<\/title>/i);
+    return m ? m[1].trim() : "(no title)";
+  }
+
+  // Popular/Latest should never be empty on page 1. If the search page gives
+  // nothing, fall back to the homepage, and if that is empty too, say why.
+  async browse(params, page) {
+    const result = await this.searchPage(params, page);
+    if (result.list.length > 0 || page > 1) return result;
+
+    const home = await this.request("/");
+    this.checkResponse(home, "the homepage");
+    const fallback = this.parseMangaList(home.body, 1);
+    if (fallback.list.length > 0) {
+      fallback.hasNextPage = false;
+      return fallback;
+    }
+    throw new Error(
+      `MangaDot: page loaded (HTTP ${home.statusCode}, title "${this.pageTitle(home.body)}", ` +
+        `${(home.body || "").length} chars) but no manga were found on it.`
+    );
+  }
+
   async getPopular(page) {
-    return await this.searchPage({ sortBy: "views", sortOrder: "desc" }, page);
+    return await this.browse({ sortBy: "views", sortOrder: "desc" }, page);
   }
 
   get supportsLatest() {
@@ -214,7 +257,7 @@ class DefaultExtension extends MProvider {
   }
 
   async getLatestUpdates(page) {
-    return await this.searchPage({ sortBy: "latest", sortOrder: "desc" }, page);
+    return await this.browse({ sortBy: "latest", sortOrder: "desc" }, page);
   }
 
   async search(query, page, filters) {
@@ -280,6 +323,7 @@ class DefaultExtension extends MProvider {
     const id = this.mangaId(url);
     const link = `${this.source.baseUrl}/manga/${id}`;
     const res = await this.request(`/manga/${id}`);
+    this.checkResponse(res, "the manga page");
     const html = res.body;
     const doc = new Document(html);
 
@@ -339,6 +383,7 @@ class DefaultExtension extends MProvider {
     const res = await this.request(`/api/manga/${mangaId}/chapters/list`, {
       "Accept": "application/json",
     });
+    this.checkResponse(res, "the chapter list");
     let data;
     try {
       data = JSON.parse(res.body);
@@ -417,6 +462,7 @@ class DefaultExtension extends MProvider {
     }
 
     const res = await this.request(path, headers);
+    this.checkResponse(res, "the chapter pages");
     let data;
     try {
       data = JSON.parse(res.body);
