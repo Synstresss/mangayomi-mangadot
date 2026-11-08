@@ -9,7 +9,7 @@ const mangayomiSources = [
     "typeSource": "single",
     "isManga": true,
     "isNsfw": false,
-    "version": "0.1.1",
+    "version": "0.1.3",
     "dateFormat": "",
     "dateFormatLocale": "",
     "pkgPath": "manga/src/en/mangadot.js"
@@ -186,6 +186,30 @@ class DefaultExtension extends MProvider {
 
   // ---------- Browse / search ----------
 
+  decodeEntities(s) {
+    return String(s)
+      .replace(/&amp;/g, "&")
+      .replace(/&quot;/g, '"')
+      .replace(/&#0?39;|&apos;/g, "'")
+      .replace(/&lt;/g, "<")
+      .replace(/&gt;/g, ">")
+      .replace(/&nbsp;/g, " ");
+  }
+
+  // The title box holds the main title followed by alternative names
+  // (romaji, Japanese...). Take only the main one.
+  mainTitle(el) {
+    const inner = el.innerHtml || "";
+    const lead = this.decodeEntities(inner.split("<")[0]).trim();
+    if (lead) return lead;
+    const kids = el.children || [];
+    if (kids.length) {
+      const first = kids[0].text.trim();
+      if (first) return first;
+    }
+    return el.text.trim();
+  }
+
   parseMangaList(html, page) {
     const doc = new Document(html);
     const list = [];
@@ -195,7 +219,7 @@ class DefaultExtension extends MProvider {
       if (!/^\/manga\/\d+$/.test(link) || seen[link]) continue;
 
       const divs = a.select("div");
-      let name = divs.length ? divs[divs.length - 1].text.trim() : "";
+      let name = divs.length ? this.mainTitle(divs[divs.length - 1]) : "";
       const img = a.selectFirst("img");
       if (!name && img) name = (img.attr("alt") || "").trim();
       if (!name) continue;
@@ -379,8 +403,86 @@ class DefaultExtension extends MProvider {
     };
   }
 
+  // MangaDot lists every translation of a chapter. Find the English language
+  // code the site uses so only English chapters are shown.
+  async englishCode(mangaId) {
+    try {
+      const res = await this.request(
+        `/api/manga/${mangaId}/chapters/filter-options`,
+        { "Accept": "application/json" }
+      );
+      const langs = (JSON.parse(res.body).languages || []).map(String);
+      return (
+        langs.find((l) => l.toLowerCase() === "en") ||
+        langs.find((l) => this.isEnglish(l)) ||
+        null
+      );
+    } catch (e) {
+      return null;
+    }
+  }
+
+  getPref(key, fallback) {
+    try {
+      const v = new SharedPreferences().get(key);
+      if (v === undefined || v === null || v === "") return fallback;
+      if (typeof fallback === "boolean") return v === true || String(v) === "true";
+      return v;
+    } catch (e) {
+      return fallback;
+    }
+  }
+
+  preferredGroups() {
+    return String(this.getPref("pref_preferred_groups", ""))
+      .split(",")
+      .map((s) => s.trim().toLowerCase())
+      .filter(Boolean);
+  }
+
+  groupNames(c) {
+    if (Array.isArray(c.groups) && c.groups.length) return c.groups.map((g) => String(g.name || ""));
+    return [c.group_name || c.scanlator_name || ""];
+  }
+
+  // MangaDot collects the same chapter from many groups and sites. Keep one
+  // entry per chapter number, like the site's own reader does: the first
+  // preferred group that has it, otherwise the earliest upload.
+  onePerChapter(items, preferred) {
+    const byNum = new Map();
+    for (const c of items) {
+      const key = Math.round((parseFloat(c.chapter_number) || 0) * 1000);
+      if (!byNum.has(key)) byNum.set(key, []);
+      byNum.get(key).push(c);
+    }
+    const rank = (c) => {
+      const names = this.groupNames(c).map((n) => n.toLowerCase());
+      for (let i = 0; i < preferred.length; i++) {
+        if (names.some((n) => n.includes(preferred[i]))) return i;
+      }
+      return preferred.length;
+    };
+    const time = (c) => Number(this.parseDate(c.date_added)) || Number.MAX_SAFE_INTEGER;
+    const out = [];
+    for (const list of byNum.values()) {
+      list.sort((a, b) => rank(a) - rank(b) || time(a) - time(b) || Number(a.id) - Number(b.id));
+      out.push(list[0]);
+    }
+    return out;
+  }
+
+  isEnglish(code) {
+    return /^(en([-_].*)?|eng|english)$/i.test(String(code || "").trim());
+  }
+
+  chapterLang(c) {
+    return String(c.language || c.lang || c.translated_language || "");
+  }
+
   async getChapters(mangaId) {
-    const res = await this.request(`/api/manga/${mangaId}/chapters/list`, {
+    const en = await this.englishCode(mangaId);
+    const qs = en ? `?lang=${encodeURIComponent(en)}` : "";
+    const res = await this.request(`/api/manga/${mangaId}/chapters/list${qs}`, {
       "Accept": "application/json",
     });
     this.checkResponse(res, "the chapter list");
@@ -392,7 +494,16 @@ class DefaultExtension extends MProvider {
         "MangaDot: could not read chapter list (Cloudflare check? Open the source in WebView once)."
       );
     }
-    const items = Array.isArray(data) ? data : data.chapters || data.data || [];
+    let items = Array.isArray(data) ? data : data.chapters || data.data || [];
+    // In case the server ignores ?lang=, filter here too when chapters carry a language.
+    if (items.some((c) => this.chapterLang(c))) {
+      const only = items.filter((c) => this.isEnglish(this.chapterLang(c)));
+      if (only.length) items = only;
+    }
+
+    if (this.getPref("pref_one_per_chapter", true)) {
+      items = this.onePerChapter(items, this.preferredGroups());
+    }
 
     const chapters = items.map((c) => {
       const num = this.formatNumber(c.chapter_number);
@@ -511,7 +622,29 @@ class DefaultExtension extends MProvider {
   }
 
   getSourcePreferences() {
-    return [];
+    return [
+      {
+        key: "pref_one_per_chapter",
+        switchPreferenceCompat: {
+          title: "One entry per chapter",
+          summary:
+            "MangaDot has the same chapter from many groups. On: show one copy per chapter. Off: show every copy.",
+          value: true,
+        },
+      },
+      {
+        key: "pref_preferred_groups",
+        editTextPreference: {
+          title: "Preferred groups",
+          summary:
+            "Comma-separated, in order of preference, e.g. VIZ Media, TCB Scans. Empty: earliest upload, like the website.",
+          value: "",
+          dialogTitle: "Preferred groups",
+          dialogMessage: "Comma-separated group names, best first",
+          text: "",
+        },
+      },
+    ];
   }
 
   async getVideoList(url) {
